@@ -1,0 +1,26 @@
+everything is in little endian btw
+data packet format:
+┌────────┬────────┬────────────────┬─────────────────┬───────┬─────────────────┬─────────────────┬───────┐
+│ header │ VerLen │ speed          │ start angle     │ data  │ end angle       │ timestamp       │ crc   │
+├────────┼────────┼────────┬───────┼────────┬────────┼───────┼────────┬────────┼────────┬────────┼───────┤
+│  0x54  │  0x2c  │ 0x00   │ 0x00  │ 0x00   │ 0x00   │  ...  │ 0x00   │ 0x00   │ 0x00   │ 0x00   │ 0x00  │
+└────────┴────────┴────────┴───────┴────────┴────────┴───────┴────────┴────────┴────────┴────────┴───────┘
+header: 1 byte, fixed at 0x54
+VerLen: 1 byte, fixed at 0x2c
+  packet type: 3 bits, fixed at 1
+  number of measurement points: 5 bits, fixed at 12
+speed: 2 byte, degrees per second
+payload start angle: 2 byte, unit is 0.01 degrees
+data: 3 byte, (payload), one or more (number described by Len of VerLen)
+payload end angle: 2 byte, unit is 0.01 degrees
+timestamp: 2 byte, unit is milliseconds
+crc check: 1 byte, covers all previous data except itself
+
+data payload format:
+┌────────────────┬────────┬────────────────┬────────┬─────┐
+│ distance       │ intns. │ distance       │ intns. │ ... │
+├────────┬───────┼────────┼────────┬───────┼────────┤     │
+│ 0x00   │ 0x00  │ 0x00   │ 0x00   │ 0x00  │ 0x00   │     │
+└────────┴───────┴────────┴────────┴───────┴────────┴─────┘
+distance: 2 byte, unit is millimeter
+intensity: 1 byte, linear interpolation between start and end angle
