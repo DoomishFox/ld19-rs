@@ -48,8 +48,8 @@ pub enum ParseError {
 
 #[derive(Debug)]
 pub struct Payload {
-    distance: u16,
-    intensity: u8,
+    pub distance: u16,
+    pub intensity: u8,
 }
 
 #[derive(Debug)]
@@ -75,12 +75,12 @@ impl Header {
 
 #[derive(Debug)]
 pub struct Packet {
-    header: Header,
-    speed: u16,
-    start_angle: u16,
-    data: Vec<Payload>,
-    end_angle: u16,
-    timestamp: u16,
+    pub header: Header,
+    pub speed: u16,
+    pub start_angle: u16,
+    pub data: Vec<Payload>,
+    pub end_angle: u16,
+    pub timestamp: u16,
     crc: u8,
 }
 
@@ -109,7 +109,7 @@ fn try_parse_descibed_packet(header: Header, slice: &[u8]) -> Result<Packet, Par
     let mut b = Vec::<u8>::new();
     b.extend_from_slice(slice);
     //b.copy_from_slice(&slice[..header.packet_bytes()]);
-    println!("[debug] described packet slice: {:?} (len:{} )", b, b.len());
+    //println!("[debug] described packet slice: {:?} (len:{} )", b, b.len());
     let speed = match b[2..4].try_into() {
         Ok(arr) => u16::from_le_bytes(arr),
         Err(_) => return Err(ParseError::InvalidPredata),
