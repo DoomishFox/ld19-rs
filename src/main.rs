@@ -1,5 +1,6 @@
 use futures::stream::StreamExt;
 use ld19::decoder::Packet;
+use raqote::{DrawOptions, DrawTarget, PathBuilder, SolidSource, Source};
 use tokio_serial::{SerialPort, SerialPortBuilderExt};
 use tokio_util::codec::Decoder;
 
@@ -9,7 +10,7 @@ mod ld19;
 struct Point {
     angle: f32,
     distance: u32,
-    confidence: u8
+    confidence: u8,
 }
 
 fn parse(packet: Packet) -> Vec<Point> {
@@ -35,9 +36,22 @@ fn parse(packet: Packet) -> Vec<Point> {
     points
 }
 
+fn polar_to_cartesian(distance: u32, theta: f32) -> (f32, f32) {
+    (
+        distance as f32 * f32::cos(theta.to_radians()),
+        distance as f32 * f32::sin(theta.to_radians()),
+    )
+}
+
 #[tokio::main]
 async fn main() {
-    println!("starting...");
+    println!("setting up drawing surface...");
+    let mut dt = DrawTarget::new(800, 800);
+    dt.clear(SolidSource::from_unpremultiplied_argb(
+        0xff, 0x00, 0x00, 0x00,
+    ));
+
+    println!("starting serial read...");
     let serial_builder = tokio_serial::new("/dev/serial0", 230_400)
         .data_bits(tokio_serial::DataBits::Eight)
         .stop_bits(tokio_serial::StopBits::One)
@@ -54,8 +68,36 @@ async fn main() {
         .read_data_set_ready()
         .expect("unable to set serial port read data ready");
 
+    let mut i = 1000;
     let mut reader = ld19::decoder::LidarCodec.framed(serial);
     while let Some(packet) = reader.next().await {
-        println!("received data: {:?}", parse(packet.expect("bad packet!")));
+        let points = parse(packet.expect("bad packet!"));
+        //println!("received data: {:?}", points);
+
+        for point in points.iter() {
+            let (x, y) = polar_to_cartesian(point.distance / 10, point.angle);
+            let mut path = PathBuilder::new();
+            path.rect(x + 400.0, y + 400.0, 1.0, 1.0);
+            let path = path.finish();
+            let confidence = point.confidence as f32 / 200.0;
+            let green = (255.0 * confidence) as u8;
+            let red = 255 - green;
+            dt.fill(
+                &path,
+                &Source::Solid(SolidSource {
+                    r: red,
+                    g: green,
+                    b: 0x00,
+                    a: 0xff,
+                }),
+                &DrawOptions::new(),
+            );
+            //println!("drawing at: {}, {}", x, y);
+        }
+        i = i - 1;
+        if i == 0 {
+            break;
+        }
     }
+    dt.write_png("lidar.png").expect("cant write output!");
 }
