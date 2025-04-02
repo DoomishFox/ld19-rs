@@ -1,10 +1,13 @@
-use std::thread;
 use futures::stream::StreamExt;
 use ld19::decoder::Packet;
+use std::thread;
 use tokio::runtime::Runtime;
 use tokio_serial::{SerialPort, SerialPortBuilderExt};
 use tokio_util::codec::Decoder;
-use winit::{dpi::PhysicalSize, event_loop::{ControlFlow, EventLoop, EventLoopProxy}};
+use winit::{
+    dpi::PhysicalSize,
+    event_loop::{ControlFlow, EventLoop, EventLoopProxy},
+};
 
 mod ld19;
 mod window;
@@ -13,17 +16,16 @@ use window::*;
 const WIDTH: u32 = 800;
 const HEIGHT: u32 = 800;
 
-
 #[tokio::main]
 async fn main() {
-    //env_logger::init();   
+    //env_logger::init();
     let event_loop = EventLoop::<UserEvent>::with_user_event().build().unwrap();
     event_loop.set_control_flow(ControlFlow::Poll);
     let mut state = State::with_size(PhysicalSize::new(WIDTH as f64, HEIGHT as f64));
     let mut surface = Surface::new(WIDTH, HEIGHT);
     surface.init();
     state.surface = Some(surface);
-    
+
     let proxy = event_loop.create_proxy();
     let _receive_thread_handle = thread::Builder::new()
         .name(String::from("lidar"))
@@ -76,7 +78,7 @@ fn write_to_surface(event_loop: EventLoopProxy<UserEvent>) {
     // Spawn the root task
     rt.block_on(async {
         println!("starting serial read...");
-        let serial_builder = tokio_serial::new("/dev/tty.usbserial-A904CUY3", 230_400)
+        let serial_builder = tokio_serial::new("/dev/tty.usbserial-0001", 230_400)
             .data_bits(tokio_serial::DataBits::Eight)
             .stop_bits(tokio_serial::StopBits::One)
             .parity(tokio_serial::Parity::None)
@@ -98,20 +100,23 @@ fn write_to_surface(event_loop: EventLoopProxy<UserEvent>) {
             let points = parse(packet.expect("bad packet!"));
             //println!("received data: {:?}", points);
 
-            let draw_points: Vec<DrawPoint> = points.iter().map(|p| {
-                let (x, y) = polar_to_cartesian(p.distance / 20, p.angle);
-                let confidence = p.confidence as f32 / 200.0;
-                let green = (255.0 * confidence) as u8;
-                let red = 255 - green;
-                //println!("drawing at: {}, {}", x, y);
-                DrawPoint {
-                    x: x + (WIDTH / 2) as f32,
-                    y: y + (HEIGHT / 2) as f32,
-                    r: red,
-                    g: green,
-                    b: 0x00,
-                }
-            }).collect();
+            let draw_points: Vec<DrawPoint> = points
+                .iter()
+                .map(|p| {
+                    let (x, y) = polar_to_cartesian(p.distance / 1, p.angle);
+                    let confidence = p.confidence as f32 / 200.0;
+                    let green = (255.0 * confidence) as u8;
+                    let red = 255 - green;
+                    //println!("drawing at: {}, {}", x, y);
+                    DrawPoint {
+                        x: x as f32,
+                        y: y as f32,
+                        r: red,
+                        g: green,
+                        b: 0x00,
+                    }
+                })
+                .collect();
 
             // write to buffer/send event
             //print!(".");
