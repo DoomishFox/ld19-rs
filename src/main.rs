@@ -1,10 +1,39 @@
 use futures::stream::StreamExt;
 use ld19::decoder::Packet;
-use raqote::{DrawOptions, DrawTarget, PathBuilder, SolidSource, Source};
+use std::thread;
+use tokio::runtime::Runtime;
 use tokio_serial::{SerialPort, SerialPortBuilderExt};
 use tokio_util::codec::Decoder;
+use winit::{
+    dpi::PhysicalSize,
+    event_loop::{ControlFlow, EventLoop, EventLoopProxy},
+};
 
 mod ld19;
+mod window;
+use window::*;
+
+const WIDTH: u32 = 800;
+const HEIGHT: u32 = 800;
+
+#[tokio::main]
+async fn main() {
+    //env_logger::init();
+    let event_loop = EventLoop::<UserEvent>::with_user_event().build().unwrap();
+    event_loop.set_control_flow(ControlFlow::Poll);
+    let mut state = State::with_size(PhysicalSize::new(WIDTH as f64, HEIGHT as f64));
+    let mut surface = Surface::new(WIDTH, HEIGHT);
+    surface.init();
+    state.surface = Some(surface);
+
+    let proxy = event_loop.create_proxy();
+    let _receive_thread_handle = thread::Builder::new()
+        .name(String::from("lidar"))
+        .spawn(move || write_to_surface(proxy))
+        .expect("[lidar] listen thread failed!");
+
+    let _runtime = event_loop.run_app(&mut state);
+}
 
 #[derive(Debug)]
 struct Point {
@@ -43,61 +72,85 @@ fn polar_to_cartesian(distance: u32, theta: f32) -> (f32, f32) {
     )
 }
 
-#[tokio::main]
-async fn main() {
-    println!("setting up drawing surface...");
-    let mut dt = DrawTarget::new(800, 800);
-    dt.clear(SolidSource::from_unpremultiplied_argb(
-        0xff, 0x00, 0x00, 0x00,
-    ));
+fn write_to_surface(event_loop: EventLoopProxy<UserEvent>) {
+    let rt = Runtime::new().expect("uh oh");
 
-    println!("starting serial read...");
-    let serial_builder = tokio_serial::new("/dev/serial0", 230_400)
-        .data_bits(tokio_serial::DataBits::Eight)
-        .stop_bits(tokio_serial::StopBits::One)
-        .parity(tokio_serial::Parity::None)
-        .flow_control(tokio_serial::FlowControl::None);
-    let mut serial = serial_builder
-        .open_native_async()
-        .expect("Failed to open port");
+    // Spawn the root task
+    rt.block_on(async {
+        println!("starting serial read...");
+        let serial_builder = tokio_serial::new("/dev/tty.usbserial-0001", 230_400)
+            .data_bits(tokio_serial::DataBits::Eight)
+            .stop_bits(tokio_serial::StopBits::One)
+            .parity(tokio_serial::Parity::None)
+            .flow_control(tokio_serial::FlowControl::None);
+        let mut serial = serial_builder
+            .open_native_async()
+            .expect("Failed to open port");
 
-    serial
-        .set_exclusive(false)
-        .expect("unable to set serial port exclusive to false");
-    serial
-        .read_data_set_ready()
-        .expect("unable to set serial port read data ready");
+        serial
+            .set_exclusive(false)
+            .expect("unable to set serial port exclusive to false");
+        serial
+            .read_data_set_ready()
+            .expect("unable to set serial port read data ready");
 
-    let mut i = 1000;
-    let mut reader = ld19::decoder::LidarCodec.framed(serial);
-    while let Some(packet) = reader.next().await {
-        let points = parse(packet.expect("bad packet!"));
-        //println!("received data: {:?}", points);
+        let mut reader = ld19::decoder::LidarCodec.framed(serial);
+        println!("beginning await for sensor data...");
+        while let Some(packet) = reader.next().await {
+            let points = parse(packet.expect("bad packet!"));
+            //println!("received data: {:?}", points);
 
-        for point in points.iter() {
-            let (x, y) = polar_to_cartesian(point.distance / 10, point.angle);
-            let mut path = PathBuilder::new();
-            path.rect(x + 400.0, y + 400.0, 1.0, 1.0);
-            let path = path.finish();
-            let confidence = point.confidence as f32 / 200.0;
-            let green = (255.0 * confidence) as u8;
-            let red = 255 - green;
-            dt.fill(
-                &path,
-                &Source::Solid(SolidSource {
-                    r: red,
-                    g: green,
-                    b: 0x00,
-                    a: 0xff,
-                }),
-                &DrawOptions::new(),
-            );
-            //println!("drawing at: {}, {}", x, y);
+            let draw_points: Vec<DrawPoint> = points
+                .iter()
+                .map(|p| {
+                    let (x, y) = polar_to_cartesian(p.distance / 1, p.angle);
+                    let confidence = p.confidence as f32 / 200.0;
+                    let green = (255.0 * confidence) as u8;
+                    let red = 255 - green;
+                    //println!("drawing at: {}, {}", x, y);
+                    DrawPoint {
+                        x: x as f32,
+                        y: y as f32,
+                        r: red,
+                        g: green,
+                        b: 0x00,
+                    }
+                })
+                .collect();
+
+            // write to buffer/send event
+            //print!(".");
+            //println!("[debug] {draw_points:?}");
+            let _ = event_loop.send_event(UserEvent::DrawPointBuffer(draw_points));
         }
-        i = i - 1;
-        if i == 0 {
-            break;
+        //dt.write_png("lidar.png").expect("cant write output!");
+    })
+}
+
+// like write_to_surface but doesnt rely on a serial device. good for testing
+fn _write_to_surface_dummy(event_loop: EventLoopProxy<UserEvent>) {
+    //println!("running dummy thread!");
+    let mut counter = 0;
+    let mut yc = 0;
+
+    loop {
+        if counter >= 800 {
+            counter = 0;
+            yc += 1;
         }
+
+        let draw_point = DrawPoint {
+            x: counter as f32,
+            y: yc as f32,
+            r: 0xFF,
+            g: 0x00,
+            b: 0x00,
+        };
+
+        counter += 1;
+
+        //println!("sending event!");
+        let _ = event_loop.send_event(UserEvent::DrawPointBuffer(vec![draw_point]));
+        std::thread::sleep(std::time::Duration::from_millis(250));
     }
-    dt.write_png("lidar.png").expect("cant write output!");
 }
