@@ -1,9 +1,13 @@
 // ld19
-use std::io::Error;
+use core::fmt;
+use std::io;
 use tokio_util::{
     bytes::{Buf, BytesMut},
     codec::Decoder,
 };
+
+// just naming this for easier readability
+const U16_LEN: usize = 2;
 
 const CRC_TABLE: [u8; 256] = [
     0x00, 0x4d, 0x9a, 0xd7, 0x79, 0x34, 0xe3, 0xae, 0xf2, 0xbf, 0x68, 0x25, 0x8b, 0xc6, 0x11, 0x5c,
@@ -30,20 +34,110 @@ fn calc_crc(bytes: &[u8], len: usize) -> u8 {
         .fold(0, |crc, b| CRC_TABLE[(crc ^ b) as usize])
 }
 
-const DATA_HEADER: u8 = 0x54;
-const DATA_VER_LEN: u8 = 0x2c;
-// datasheet claims there's always gonna be 12 ¯\_(ツ)_/¯
-const PAYLOAD_COUNT: usize = 12;
-const PAYLOAD_BYTES: usize = 3;
-const HEADER_BYTES: usize = 2;
-const PACKET_BYTES: usize = 47;
-
+#[derive(Debug)]
 pub enum ParseError {
     InvalidHeader,
     InvalidPredata,
     InvalidPayloadLength,
     InvalidPayload,
     InvalidPostdata,
+    DescribedLengthMismatch,
+    // other io errors
+    Io(io::Error),
+}
+
+impl fmt::Display for ParseError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ParseError::InvalidHeader => write!(f, "invalid header"),
+            ParseError::InvalidPredata => write!(f, "invalid predata"),
+            ParseError::InvalidPayloadLength => write!(f, "invalid payload length"),
+            ParseError::InvalidPayload => write!(f, "invalid payload"),
+            ParseError::InvalidPostdata => write!(f, "invalid postdata"),
+            ParseError::DescribedLengthMismatch => write!(f, "described length mismatch"),
+            ParseError::Io(e) => write!(f, "{}", e),
+        }
+    }
+}
+
+impl From<io::Error> for ParseError {
+    fn from(e: io::Error) -> ParseError {
+        ParseError::Io(e)
+    }
+}
+
+impl std::error::Error for ParseError {}
+
+#[derive(Debug)]
+pub struct Header {
+    header: u8,
+    ver_len: u8,
+}
+
+impl fmt::Display for Header {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "Header {{ indicator: {}, version: {}, length (payload count): {} }}",
+            Self::INDICATOR,
+            self.version(),
+            self.payload_count(),
+        )
+    }
+}
+
+impl Header {
+    const BYTES: usize = 2;
+    const INDICATOR: u8 = 0x54;
+    const VER_LEN_DEFAULT: u8 = 0x2c;
+
+    /// attempt to parse slice using the header indicator value. if indicator
+    /// value is not present at the start of the slice, an InvalidHeader
+    /// ParseError will result.
+    fn try_parse(bytes: &[u8]) -> Result<Self, ParseError> {
+        if bytes[0] != Self::INDICATOR {
+            return Err(ParseError::InvalidHeader);
+        }
+        Ok(Self {
+            header: Self::INDICATOR,
+            ver_len: bytes[1],
+        })
+    }
+    /// attempt to parse slice using both the header indicator value and the
+    /// default ver_len (0x2c) so as to avoid rare edge cases. only possible
+    /// when ver_len is static. if indicator value is not present at the start
+    /// of the slice, or ver_len is not the default value, an InvalidHeader
+    /// ParseError will result.
+    fn try_parse_strict(bytes: &[u8]) -> Result<Self, ParseError> {
+        if bytes.len() < Self::BYTES {
+            return Err(ParseError::InvalidHeader);
+        }
+        // length check since we're check 2 values
+        if bytes[0] != Self::INDICATOR {
+            return Err(ParseError::InvalidHeader);
+        }
+        if bytes[1] != Self::VER_LEN_DEFAULT {
+            return Err(ParseError::InvalidHeader);
+        }
+        Ok(Self {
+            header: Self::INDICATOR,
+            ver_len: bytes[1],
+        })
+    }
+    fn version(&self) -> usize {
+        (self.ver_len >> 5) as usize
+    }
+    fn payload_count(&self) -> usize {
+        (self.ver_len & 0b00011111) as usize
+    }
+    fn payload_bytes(&self) -> usize {
+        self.payload_count() * Payload::BYTES
+    }
+    fn described_bytes(&self) -> usize {
+        // header bytes + payload bytes + rest of packet bytes (speed,
+        // timestamp, crc, etc.)
+        Self::BYTES + self.payload_bytes() + 9
+    }
 }
 
 #[derive(Debug)]
@@ -52,24 +146,33 @@ pub struct Payload {
     pub intensity: u8,
 }
 
-#[derive(Debug)]
-pub struct Header {
-    header: u8,
-    ver_len: u8,
+impl fmt::Display for Payload {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "Payload {{ distance: {}, intensity: {} }}",
+            self.distance, self.intensity,
+        )
+    }
 }
 
-impl Header {
-    fn packet_bytes(&self) -> usize {
-        PACKET_BYTES
+impl Payload {
+    const BYTES: usize = 3;
+
+    fn try_from_bytes(bytes: &[u8]) -> Result<Self, ParseError> {
+        if bytes.len() < Self::BYTES {
+            return Err(ParseError::InvalidPayloadLength);
+        }
+        Ok(Self::from_bytes(bytes))
     }
-    fn payload_count(&self) -> usize {
-        PAYLOAD_COUNT
-    }
-    fn payload_bytes(&self) -> usize {
-        // technically i should check verlen for the DataPayload length,
-        // but because the datasheet claims verlen is fixed we can assume there
-        // is always 12 payloads
-        PAYLOAD_COUNT * PAYLOAD_BYTES
+    fn from_bytes(bytes: &[u8]) -> Self {
+        let distance = u16::from_le_bytes(bytes[..U16_LEN].try_into().unwrap()).clone();
+        let intensity = bytes[U16_LEN].clone();
+
+        Self {
+            distance,
+            intensity,
+        }
     }
 }
 
@@ -84,119 +187,175 @@ pub struct Packet {
     crc: u8,
 }
 
+impl fmt::Display for Packet {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "Packet timestamped (ms): {} \
+            {{ \
+            version: {}, \
+            degrees per second: {}, \
+            starting angle: {}, \
+            ending angle: {}, \
+            data points: [",
+            self.timestamp,
+            self.header.version(),
+            self.speed,
+            self.start_angle,
+            self.end_angle,
+        )?;
+        let mut first = true;
+        for payload in &self.data {
+            if !first {
+                write!(f, ", {}", payload)?;
+            } else {
+                write!(f, "{}", payload)?;
+            }
+            first = false
+        }
+        write!(f, "], crc: {} }}", self.crc)
+    }
+}
+
 impl Packet {
-    pub fn calculate_crc(&self) -> u8 {
-        self.crc
-    }
-}
+    const IDX_SPEED: usize = 2;
+    const IDX_START_ANGLE: usize = 4;
+    const IDX_PAYLOAD: usize = 6;
+    const OFST_TIMESTAMP: usize = 2;
+    const OFST_CRC: usize = 4;
 
-fn parse_header(slice: &[u8]) -> Option<Header> {
-    let header = slice[0];
-    if header != DATA_HEADER {
-        return None;
+    fn try_from_described_bytes(header: Header, bytes: &[u8]) -> Result<Self, ParseError> {
+        if bytes.len() < header.described_bytes() {
+            return Err(ParseError::DescribedLengthMismatch);
+        }
+        Ok(Self::from_described_bytes(header, bytes))
     }
-    let ver_len = slice[1];
-    if ver_len != DATA_VER_LEN {
-        return None;
-    }
-    return Some(Header { header, ver_len });
-}
+    fn from_described_bytes(header: Header, bytes: &[u8]) -> Self {
+        // not sure why i did the extend_from_slice thing before, i think it
+        // was because otherwise i ended up with references stored in the
+        // resultant Packet? clone() should fix that tho...
+        //let mut b = Vec::<u8>::new();
+        //b.extend_from_slice(bytes);
+        let speed = u16::from_le_bytes(
+            bytes[Self::IDX_SPEED..Self::IDX_SPEED + U16_LEN]
+                .try_into()
+                .unwrap(),
+        )
+        .clone();
+        let start_angle = u16::from_le_bytes(
+            bytes[Self::IDX_START_ANGLE..Self::IDX_START_ANGLE + U16_LEN]
+                .try_into()
+                .unwrap(),
+        )
+        .clone();
 
-fn try_parse_descibed_packet(header: Header, slice: &[u8]) -> Result<Packet, ParseError> {
-    // see what i should do is use payload_length to parse that many
-    // DataPayloads, but i dont want to do that right now so im sticking
-    // with just using the datasheet's claim of 12
-    let mut b = Vec::<u8>::new();
-    b.extend_from_slice(slice);
-    //b.copy_from_slice(&slice[..header.packet_bytes()]);
-    //println!("[debug] described packet slice: {:?} (len:{} )", b, b.len());
-    let speed = match b[2..4].try_into() {
-        Ok(arr) => u16::from_le_bytes(arr),
-        Err(_) => return Err(ParseError::InvalidPredata),
-    };
-    let start_angle = match b[4..6].try_into() {
-        Ok(arr) => u16::from_le_bytes(arr),
-        Err(_) => return Err(ParseError::InvalidPredata),
-    };
-    // data: b[6..(6+(payload_count * PAYLOAD_BYTES))]
-    let payload_count = header.payload_count();
-    let data = try_parse_n_payloads(payload_count, slice)?;
-    let payload_end_index = 6 + header.payload_bytes();
-    let end_angle = match b[payload_end_index..(payload_end_index + 2)].try_into() {
-        Ok(arr) => u16::from_le_bytes(arr),
-        Err(_) => return Err(ParseError::InvalidPostdata),
-    };
-    let timestamp = match b[(payload_end_index + 2)..(payload_end_index + 4)].try_into() {
-        Ok(arr) => u16::from_le_bytes(arr),
-        Err(_) => return Err(ParseError::InvalidPostdata),
-    };
-    let crc = b[payload_end_index + 4];
-    Ok(Packet {
-        header,
-        speed,
-        start_angle,
-        data,
-        end_angle,
-        timestamp,
-        crc,
-    })
-}
+        let mut data = Vec::<Payload>::new();
+        for i in 0..(header.payload_count()) {
+            data.push(Payload::from_bytes(
+                bytes[Self::IDX_PAYLOAD + (i * Payload::BYTES)
+                    ..Self::IDX_PAYLOAD + (i * Payload::BYTES) + Payload::BYTES]
+                    .try_into()
+                    .unwrap(),
+            ));
+        }
+        let idx_payload_end: usize = Self::IDX_PAYLOAD + (data.len() * Payload::BYTES);
 
-fn try_parse_n_payloads(n: usize, slice: &[u8]) -> Result<Vec<Payload>, ParseError> {
-    if slice.len() < n * PAYLOAD_BYTES {
-        return Err(ParseError::InvalidPayloadLength);
+        let end_angle = u16::from_le_bytes(
+            bytes[idx_payload_end..idx_payload_end + U16_LEN]
+                .try_into()
+                .unwrap(),
+        )
+        .clone();
+        let timestamp = u16::from_le_bytes(
+            bytes[idx_payload_end + Self::OFST_TIMESTAMP
+                ..idx_payload_end + Self::OFST_TIMESTAMP + U16_LEN]
+                .try_into()
+                .unwrap(),
+        )
+        .clone();
+        let crc = bytes[idx_payload_end + Self::OFST_CRC].clone();
+
+        Self {
+            header,
+            speed,
+            start_angle,
+            data,
+            end_angle,
+            timestamp,
+            crc,
+        }
     }
-    let mut data = Vec::<Payload>::new();
-    for i in 0..(n - 1) {
-        let distance = match slice[(i * PAYLOAD_BYTES)..((i * PAYLOAD_BYTES) + 2)].try_into() {
-            Ok(arr) => u16::from_le_bytes(arr),
-            Err(_) => return Err(ParseError::InvalidPayload),
-        };
-        let intensity = slice[(i * PAYLOAD_BYTES) + 2];
-        data.push(Payload {
-            distance,
-            intensity,
-        })
+    fn try_get_crc_from_described_bytes(header: &Header, bytes: &[u8]) -> Result<u8, ParseError> {
+        if bytes.len() < header.described_bytes() {
+            return Err(ParseError::DescribedLengthMismatch);
+        }
+        Ok(Self::get_crc_from_described_bytes(header, bytes))
     }
-    Ok(data)
+    fn get_crc_from_described_bytes(header: &Header, bytes: &[u8]) -> u8 {
+        let idx_payload_end: usize = Self::IDX_PAYLOAD + header.payload_bytes();
+        bytes[idx_payload_end + Self::OFST_CRC].clone()
+        // lmao, technically i could also just do
+        //bytes[header.described_bytes() - 1].clone()
+    }
+    fn as_bytes(&self) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        bytes.push(self.header.header);
+        bytes.push(self.header.ver_len);
+        bytes.extend(self.speed.to_le_bytes());
+        bytes.extend(self.start_angle.to_le_bytes());
+        for payload in &self.data {
+            bytes.extend(payload.distance.to_le_bytes());
+            bytes.push(payload.intensity);
+        }
+        bytes.extend(self.end_angle.to_le_bytes());
+        bytes.extend(self.timestamp.to_le_bytes());
+        bytes.push(self.crc);
+        return bytes;
+    }
+    fn length_in_bytes(&self) -> usize {
+        Header::BYTES + self.data.len() + 9
+    }
 }
 
 pub struct LidarCodec;
 
 impl Decoder for LidarCodec {
     type Item = Packet;
-    type Error = std::io::Error;
+    type Error = ParseError;
     // everything is in little endian btw
     // check serial_data_format.txt for format details but also its in the
     // DataPacket and DataPayload structs
     fn decode(&mut self, src: &mut BytesMut) -> Result<Option<Self::Item>, Self::Error> {
         let current_len = src.len();
-        if current_len < HEADER_BYTES {
+        if current_len < Header::BYTES {
             // reserve enough for at least a header
-            src.reserve(HEADER_BYTES);
+            src.reserve(Header::BYTES - current_len);
             return Ok(None);
         }
         // check the header now
-        if let Some(header) = parse_header(&src[..2]) {
-            if current_len < header.packet_bytes() {
-                // packet not big enough so reserve it (plus buffer just in case)
-                src.reserve(header.packet_bytes() - current_len);
+        if let Ok(header) = Header::try_parse(&src[..2]) {
+            if current_len < header.described_bytes() {
+                // packet not big enough so reserve it
+                src.reserve(header.described_bytes() - current_len);
                 return Ok(None);
             }
-            let packet_data = src.split_to(header.packet_bytes());
-            return match try_parse_descibed_packet(header, packet_data.as_ref()) {
-                Ok(packet) => {
-                    // verify crc
-                    Ok(Some(packet))
-                }
-                Err(ParseError::InvalidHeader) => Err(Error::other("invalid header")),
-                Err(ParseError::InvalidPredata) => Err(Error::other("invalid predata")),
-                Err(ParseError::InvalidPayloadLength) => {
-                    Err(Error::other("invalid payload length"))
-                }
-                Err(ParseError::InvalidPayload) => Err(Error::other("invalid payload")),
-                Err(ParseError::InvalidPostdata) => Err(Error::other("invalid postdata")),
-            };
+            let packet_data = src.split_to(header.described_bytes());
+
+            // we verify the crc before parsing to make sure we received the
+            // data we should have. if not, there's no need to parse it. since
+            // the crc calculation does not include the crc value, we can
+            // decrease the packet_data length to ignore it
+            if Packet::get_crc_from_described_bytes(&header, &packet_data)
+            != calc_crc(&packet_data, header.described_bytes() - 1)
+            {
+                // here is a great spot to log a warning if i ever get around
+                // to implementing logging
+                return Ok(None);
+            }
+
+            // length check has already been satisfied so no need for try_*
+            // functions, we can just shove the data into shape
+            return Ok(Some(Packet::from_described_bytes(header, &packet_data)));
         } else {
             // no header was parsed, split off the first byte loop and try the next one
             let _ = src.advance(1);
